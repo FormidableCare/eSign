@@ -1,20 +1,32 @@
 # Formidable eSign
 
-Sign a document without sending the document or its URL to Formidable eSign.
+Formidable eSign supports two document-signing flows:
 
-## 1. Hash the document locally
+| Document | Result | What is sent to Formidable eSign |
+|---|---|---|
+| JSON / FHIR | Detached CMS signature | SHA-256 hash only |
+| PDF | PDF with embedded CMS signature and CA chain | PDF bytes, never a document URL |
+
+Set these values before running the examples:
 
 ```bash
-DOCUMENT_HASH=$(openssl dgst -sha256 -r document.pdf | cut -d' ' -f1)
-echo "$DOCUMENT_HASH"
+export FESIGN_API_URL="https://api.fesign.formidable.care"
+export FESIGN_API_KEY="..."
+export FESIGN_CERT_ID="..."
+export FESIGN_PIN="..."
 ```
 
-The result is a 64-character SHA-256 hash. The same document bytes always
-produce the same hash; any change produces a different hash.
+## Sign a JSON / FHIR document
 
-## 2. Sign the hash
+Hash the exact UTF-8 file bytes locally. JSON whitespace and property order are
+part of those bytes, so preserve the signed file or agree on a canonical JSON
+format before hashing reconstructed objects.
+
+### Hash and sign
 
 ```bash
+DOCUMENT_HASH=$(openssl dgst -sha256 -r patient.fhir.json | cut -d' ' -f1)
+
 SIGNATURE=$(
   jq -n \
     --arg hash "$DOCUMENT_HASH" \
@@ -30,10 +42,9 @@ SIGNATURE=$(
 )
 ```
 
-Only the hash is signed. Do not include the document URL, filename, or document
-contents in the request or optional metadata.
+Only the hash is sent. Do not put the document, filename, or URL in metadata.
 
-## 3. Verify with Formidable eSign
+### Verify with Formidable eSign
 
 ```bash
 jq -n \
@@ -47,13 +58,9 @@ curl --silent --fail-with-body \
   --data-binary @-
 ```
 
-A valid response returns `"isValid": true` and the certificate, chain, hash,
-and signature checks.
+A valid response returns `"isValid": true`.
 
-## 4. Verify locally
-
-Decode the returned signature, fetch the Formidable eSign trust anchor, and
-verify the original document with OpenSSL:
+### Verify locally
 
 ```bash
 printf '%s' "$SIGNATURE" |
@@ -70,69 +77,87 @@ openssl cms -verify \
   -binary \
   -inform DER \
   -in signature.p7s \
-  -content document.pdf \
+  -content patient.fhir.json \
   -CAfile fesign-root-ca.crt \
   -purpose any \
   -out /dev/null
 ```
 
-OpenSSL exits successfully only when the document hash, signature, and
-certificate chain are valid.
+## Sign a PDF
+
+`signPDF` receives the PDF, signs its PDF `ByteRange`, and returns a PDF with the
+signature and certificate chain embedded. No document URL is used.
+
+```bash
+curl --silent --fail-with-body \
+  --request POST "$FESIGN_API_URL/documents/signPDF" \
+  --header "x-api-key: $FESIGN_API_KEY" \
+  --form "pdf=@document.pdf;type=application/pdf" \
+  --form "certId=$FESIGN_CERT_ID" \
+  --form "pin=$FESIGN_PIN" |
+jq -r '.signedPdf' |
+base64 --decode > signed-document.pdf
+```
+
+The PDF limit is 10 MB. Verify the result in Adobe Acrobat or with
+[`pdfsig`](https://manpages.debian.org/pdfsig) after trusting the Formidable
+eSign Root CA:
+
+```bash
+pdfsig signed-document.pdf
+```
 
 ## JavaScript (Node.js)
 
-Uses Node.js 18+ built-ins: [`node:crypto`](https://nodejs.org/api/crypto.html),
-`fetch`, and `node:child_process`. OpenSSL is used for local CMS verification.
-No npm package is required.
+Uses Node.js 20+ built-ins: [`node:crypto`](https://nodejs.org/api/crypto.html),
+`fetch`, `FormData`, and `Blob`. No npm package is required.
 
 ```javascript
 // esign.mjs
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
 
 const apiUrl = required("FESIGN_API_URL").replace(/\/$/, "");
 const apiKey = required("FESIGN_API_KEY");
 const certId = required("FESIGN_CERT_ID");
 const pin = required("FESIGN_PIN");
-const documentPath = "document.pdf";
 
-// 1. Hash locally.
-const document = await readFile(documentPath);
-const hash = createHash("sha256").update(document).digest("hex");
-console.log({ hash });
+// JSON / FHIR: hash locally, sign only the hash, then verify it.
+const fhir = await readFile("patient.fhir.json");
+const hash = createHash("sha256").update(fhir).digest("hex");
 
-// 2. Sign only the hash. No document or URL is sent.
-const signed = await post("/documents/signHash", { hash, certId, pin });
-const signature = signed.signature;
-
-// 3. Verify with Formidable eSign.
-const verification = await post("/documents/validate", { hash, signature });
-if (!verification.isValid) throw new Error("Formidable eSign verification failed");
-console.log("Formidable eSign verification: valid");
-
-// 4. Verify locally with OpenSSL.
-const envelope = JSON.parse(Buffer.from(signature, "base64").toString("utf8"));
-await writeFile("signature.p7s", Buffer.from(envelope.signature, "base64"));
-
-const rootResponse = await fetch(`${apiUrl}/certificates/root-ca`, {
-  headers: { "x-api-key": apiKey },
+const signedHash = await postJson("/documents/signHash", {
+  hash,
+  certId,
+  pin,
 });
-if (!rootResponse.ok) throw new Error(await rootResponse.text());
-await writeFile("fesign-root-ca.crt", Buffer.from(await rootResponse.arrayBuffer()));
 
-const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
-const openssl = spawnSync("openssl", [
-  "cms", "-verify", "-binary", "-inform", "DER",
-  "-in", "signature.p7s", "-content", documentPath,
-  "-CAfile", "fesign-root-ca.crt", "-purpose", "any",
-  "-out", nullDevice,
-], { stdio: "inherit" });
+const verification = await postJson("/documents/validate", {
+  hash,
+  signature: signedHash.signature,
+});
 
-if (openssl.status !== 0) throw new Error("Local verification failed");
-console.log("Local verification: valid");
+if (!verification.isValid) throw new Error("FHIR signature is invalid");
+await writeFile("patient.fhir.signature", signedHash.signature);
 
-async function post(path, body) {
+// PDF: upload the bytes and save the returned PDF with its embedded signature.
+const pdf = await readFile("document.pdf");
+const form = new FormData();
+form.append("pdf", new Blob([pdf], { type: "application/pdf" }), "document.pdf");
+form.append("certId", certId);
+form.append("pin", pin);
+
+const pdfResponse = await fetch(`${apiUrl}/documents/signPDF`, {
+  method: "POST",
+  headers: { "x-api-key": apiKey },
+  body: form,
+});
+if (!pdfResponse.ok) throw new Error(await pdfResponse.text());
+
+const signedPdf = await pdfResponse.json();
+await writeFile("signed-document.pdf", Buffer.from(signedPdf.signedPdf, "base64"));
+
+async function postJson(path, body) {
   const response = await fetch(`${apiUrl}${path}`, {
     method: "POST",
     headers: {
@@ -154,13 +179,14 @@ function required(name) {
 
 ```bash
 node esign.mjs
+pdfsig signed-document.pdf
 ```
 
 ## .NET (C#)
 
 Uses `SHA256`, `HttpClient`, and
 [`SignedCms`](https://learn.microsoft.com/dotnet/api/system.security.cryptography.pkcs.signedcms).
-Add the PKCS package:
+Add the PKCS package for local JSON/FHIR verification:
 
 ```bash
 dotnet add package System.Security.Cryptography.Pkcs
@@ -168,6 +194,7 @@ dotnet add package System.Security.Cryptography.Pkcs
 
 ```csharp
 // Program.cs — .NET 8+
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Security.Cryptography.Pkcs;
@@ -178,17 +205,14 @@ var apiUrl = Required("FESIGN_API_URL").TrimEnd('/') + "/";
 var apiKey = Required("FESIGN_API_KEY");
 var certId = Required("FESIGN_CERT_ID");
 var pin = Required("FESIGN_PIN");
-const string documentPath = "document.pdf";
 
 using var client = new HttpClient { BaseAddress = new Uri(apiUrl) };
 client.DefaultRequestHeaders.Add("x-api-key", apiKey);
 
-// 1. Hash locally.
-var document = await File.ReadAllBytesAsync(documentPath);
-var hash = Convert.ToHexString(SHA256.HashData(document)).ToLowerInvariant();
-Console.WriteLine($"Hash: {hash}");
+// JSON / FHIR: hash locally and sign only the hash.
+var fhir = await File.ReadAllBytesAsync("patient.fhir.json");
+var hash = Convert.ToHexString(SHA256.HashData(fhir)).ToLowerInvariant();
 
-// 2. Sign only the hash. No document or URL is sent.
 using var signResponse = await client.PostAsJsonAsync(
     "documents/signHash",
     new { hash, certId, pin });
@@ -196,9 +220,10 @@ signResponse.EnsureSuccessStatusCode();
 
 using var signJson = JsonDocument.Parse(await signResponse.Content.ReadAsStreamAsync());
 var signature = signJson.RootElement.GetProperty("signature").GetString()
-    ?? throw new InvalidOperationException("Signature missing");
+    ?? throw new CryptographicException("Signature missing");
+await File.WriteAllTextAsync("patient.fhir.signature", signature);
 
-// 3. Verify with Formidable eSign.
+// Verify with Formidable eSign.
 using var verifyResponse = await client.PostAsJsonAsync(
     "documents/validate",
     new { hash, signature });
@@ -206,16 +231,15 @@ verifyResponse.EnsureSuccessStatusCode();
 
 using var verifyJson = JsonDocument.Parse(await verifyResponse.Content.ReadAsStreamAsync());
 if (!verifyJson.RootElement.GetProperty("isValid").GetBoolean())
-    throw new CryptographicException("Formidable eSign verification failed");
-Console.WriteLine("Formidable eSign verification: valid");
+    throw new CryptographicException("FHIR signature is invalid");
 
-// 4. Verify the detached CMS signature and certificate chain locally.
+// Verify the detached CMS signature and its certificate chain locally.
 using var envelope = JsonDocument.Parse(Convert.FromBase64String(signature));
 var cmsBytes = Convert.FromBase64String(
     envelope.RootElement.GetProperty("signature").GetString()
-    ?? throw new InvalidOperationException("CMS signature missing"));
+    ?? throw new CryptographicException("CMS signature missing"));
 
-var cms = new SignedCms(new ContentInfo(document), detached: true);
+var cms = new SignedCms(new ContentInfo(fhir), detached: true);
 cms.Decode(cmsBytes);
 cms.CheckSignature(verifySignatureOnly: true);
 
@@ -229,10 +253,29 @@ chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
 chain.ChainPolicy.CustomTrustStore.Add(root);
 chain.ChainPolicy.ExtraStore.AddRange(cms.Certificates);
 chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-
 if (!chain.Build(signer))
-    throw new CryptographicException("Certificate chain verification failed");
-Console.WriteLine("Local verification: valid");
+    throw new CryptographicException("Certificate chain is invalid");
+
+// PDF: upload the bytes and save the PDF with its embedded signature.
+var pdf = await File.ReadAllBytesAsync("document.pdf");
+using var pdfContent = new ByteArrayContent(pdf);
+pdfContent.Headers.ContentType = new MediaTypeHeaderValue("application/pdf");
+
+using var form = new MultipartFormDataContent
+{
+    { pdfContent, "pdf", "document.pdf" },
+    { new StringContent(certId), "certId" },
+    { new StringContent(pin), "pin" },
+};
+
+using var pdfResponse = await client.PostAsync("documents/signPDF", form);
+pdfResponse.EnsureSuccessStatusCode();
+
+using var pdfJson = JsonDocument.Parse(await pdfResponse.Content.ReadAsStreamAsync());
+var signedPdf = Convert.FromBase64String(
+    pdfJson.RootElement.GetProperty("signedPdf").GetString()
+    ?? throw new CryptographicException("Signed PDF missing"));
+await File.WriteAllBytesAsync("signed-document.pdf", signedPdf);
 
 static string Required(string name) =>
     Environment.GetEnvironmentVariable(name)
@@ -241,6 +284,7 @@ static string Required(string name) =>
 
 ```bash
 dotnet run
+pdfsig signed-document.pdf
 ```
 
 ## More
