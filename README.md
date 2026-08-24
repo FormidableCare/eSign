@@ -1,13 +1,6 @@
 # Formidable eSign
 
-Formidable eSign supports two document-signing flows:
-
-| Document | Result | What is sent to Formidable eSign |
-|---|---|---|
-| JSON / FHIR | Detached CMS signature | SHA-256 hash only |
-| PDF | PDF with embedded CMS signature and CA chain | PDF bytes, never a document URL |
-
-Set these values before running the examples:
+## Setup
 
 ```bash
 export FESIGN_API_URL="https://api.fesign.formidable.care"
@@ -18,9 +11,8 @@ export FESIGN_PIN="..."
 
 ## Sign a JSON / FHIR document
 
-Hash the exact UTF-8 file bytes locally. JSON whitespace and property order are
-part of those bytes, so preserve the signed file or agree on a canonical JSON
-format before hashing reconstructed objects.
+Hash the file locally, then sign the hash. Use the same file bytes when
+verifying.
 
 ### Hash and sign
 
@@ -41,8 +33,6 @@ SIGNATURE=$(
   jq -r '.signature'
 )
 ```
-
-Only the hash is sent. Do not put the document, filename, or URL in metadata.
 
 ### Verify with Formidable eSign
 
@@ -82,14 +72,11 @@ openssl cms -verify \
   -out /dev/null
 ```
 
-OpenSSL applies its default S/MIME signing purpose, matching the signer
-certificate's email-protection EKU. This local check does not perform CRL or
-OCSP revocation checks.
+Local verification does not check certificate revocation.
 
 ## Sign a PDF
 
-`signPDF` receives the PDF, signs its PDF `ByteRange`, and returns a PDF with the
-signature and certificate chain embedded. No document URL is used.
+Upload the PDF and save the signed PDF returned by Formidable eSign.
 
 ```bash
 curl --silent --fail-with-body \
@@ -102,7 +89,7 @@ jq -r '.signedPdf' |
 base64 --decode > signed-document.pdf
 ```
 
-The PDF limit is 10 MB. Verify the result in Adobe Acrobat or with
+Maximum size: 10 MB. Verify the result in Adobe Acrobat or with
 [`pdfsig`](https://manpages.debian.org/pdfsig) after trusting the Formidable
 eSign Root CA:
 
@@ -302,9 +289,6 @@ static string Required(string name)
 dotnet run
 pdfsig signed-document.pdf
 ```
-
-The .NET chain check enforces the email-protection EKU used by Formidable eSign.
-It does not perform CRL or OCSP revocation checks.
 
 ## More
 
