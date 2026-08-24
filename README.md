@@ -90,8 +90,7 @@ base64 --decode > signed-document.pdf
 ```
 
 Maximum size: 10 MB. Verify the result in Adobe Acrobat or with
-[`pdfsig`](https://manpages.debian.org/pdfsig) after trusting the Formidable
-eSign Root CA:
+[`pdfsig`](https://manpages.debian.org/pdfsig):
 
 ```bash
 pdfsig signed-document.pdf
