@@ -79,9 +79,12 @@ openssl cms -verify \
   -in signature.p7s \
   -content patient.fhir.json \
   -CAfile fesign-root-ca.crt \
-  -purpose any \
   -out /dev/null
 ```
+
+OpenSSL applies its default S/MIME signing purpose, matching the signer
+certificate's email-protection EKU. This local check does not perform CRL or
+OCSP revocation checks.
 
 ## Sign a PDF
 
@@ -117,7 +120,7 @@ Uses Node.js 20+ built-ins: [`node:crypto`](https://nodejs.org/api/crypto.html),
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 
-const apiUrl = required("FESIGN_API_URL").replace(/\/$/, "");
+const apiUrl = httpsUrl(required("FESIGN_API_URL"));
 const apiKey = required("FESIGN_API_KEY");
 const certId = required("FESIGN_CERT_ID");
 const pin = required("FESIGN_PIN");
@@ -172,8 +175,14 @@ async function postJson(path, body) {
 
 function required(name) {
   const value = process.env[name];
-  if (!value) throw new Error(`Missing ${name}`);
+  if (!value?.trim()) throw new Error(`Missing ${name}`);
   return value;
+}
+
+function httpsUrl(value) {
+  const url = new URL(value);
+  if (url.protocol !== "https:") throw new Error("FESIGN_API_URL must use HTTPS");
+  return url.href.replace(/\/$/, "");
 }
 ```
 
@@ -201,12 +210,14 @@ using System.Security.Cryptography.Pkcs;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 
-var apiUrl = Required("FESIGN_API_URL").TrimEnd('/') + "/";
+var apiUrl = new Uri(Required("FESIGN_API_URL").TrimEnd('/') + "/");
+if (apiUrl.Scheme != Uri.UriSchemeHttps)
+    throw new InvalidOperationException("FESIGN_API_URL must use HTTPS");
 var apiKey = Required("FESIGN_API_KEY");
 var certId = Required("FESIGN_CERT_ID");
 var pin = Required("FESIGN_PIN");
 
-using var client = new HttpClient { BaseAddress = new Uri(apiUrl) };
+using var client = new HttpClient { BaseAddress = apiUrl };
 client.DefaultRequestHeaders.Add("x-api-key", apiKey);
 
 // JSON / FHIR: hash locally and sign only the hash.
@@ -252,6 +263,7 @@ using var chain = new X509Chain();
 chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
 chain.ChainPolicy.CustomTrustStore.Add(root);
 chain.ChainPolicy.ExtraStore.AddRange(cms.Certificates);
+chain.ChainPolicy.ApplicationPolicy.Add(new Oid("1.3.6.1.5.5.7.3.4"));
 chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
 if (!chain.Build(signer))
     throw new CryptographicException("Certificate chain is invalid");
@@ -277,15 +289,22 @@ var signedPdf = Convert.FromBase64String(
     ?? throw new CryptographicException("Signed PDF missing"));
 await File.WriteAllBytesAsync("signed-document.pdf", signedPdf);
 
-static string Required(string name) =>
-    Environment.GetEnvironmentVariable(name)
-    ?? throw new InvalidOperationException($"Missing {name}");
+static string Required(string name)
+{
+    var value = Environment.GetEnvironmentVariable(name);
+    return !string.IsNullOrWhiteSpace(value)
+        ? value
+        : throw new InvalidOperationException($"Missing {name}");
+}
 ```
 
 ```bash
 dotnet run
 pdfsig signed-document.pdf
 ```
+
+The .NET chain check enforces the email-protection EKU used by Formidable eSign.
+It does not perform CRL or OCSP revocation checks.
 
 ## More
 
